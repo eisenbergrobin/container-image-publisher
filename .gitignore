@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+smoke.sh
+moving-tags
+jobs.json
+upstream/

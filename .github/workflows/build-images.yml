@@ -1,0 +1,261 @@
+name: build-images
+
+# Weekly: for every enabled app in containers.yml, resolve the upstream ref it tracks, build
+# that exact commit with the upstream repo's own Dockerfile, smoke test the result, and only
+# then move the rolling tags onto it. Anything that updates by comparing a registry tag
+# pulls those, so the app looks like any other official image.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"          # Mondays ~05:17 UTC; weekly, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Only this app (leave blank for every enabled app)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the version tag is already in ghcr.io"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      apps: ${{ steps.pick.outputs.apps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Schema check
+        run: python scripts/plan.py --validate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - id: pick
+        name: Matrix
+        env:
+          WANT: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          mapfile -t all < <(python scripts/plan.py --list)
+          printf 'enabled apps: %s\n' "${all[*]}"
+          if [[ -n "$WANT" ]]; then
+            if ! printf '%s\n' "${all[@]}" | grep -qx "$WANT"; then
+              echo "unknown app '$WANT'; enabled: ${all[*]}" >&2
+              exit 1
+            fi
+            apps=( "$WANT" )
+          else
+            apps=( "${all[@]}" )
+          fi
+          apps_json="$(printf '%s\n' "${apps[@]}" | python -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+          echo "apps=$apps_json" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180            # a CUDA compile from a cold cache is slow
+    strategy:
+      fail-fast: false              # one broken upstream must not stop the others updating
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --quiet pyyaml
+
+      - id: resolve
+        name: Resolve the upstream commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          python scripts/plan.py --resolve "${{ matrix.app }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: fresh
+        name: Is this version already published?
+        if: inputs.force != true
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:$VERSION is already published - nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:$VERSION is new - building it"
+          fi
+
+      - name: Check out the upstream project at that commit
+        if: steps.fresh.outputs.exists != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.resolve.outputs.upstream }}
+          ref: ${{ steps.resolve.outputs.sha }}   # exact commit, never a moving branch
+          path: upstream
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Reclaim runner disk
+        if: steps.fresh.outputs.exists != 'true'
+        run: |
+          set -uo pipefail
+          df -h / | tail -1
+          docker image prune -f >/dev/null 2>&1 || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - id: build
+        name: Build and publish the version tag
+        if: steps.fresh.outputs.exists != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: upstream/${{ steps.resolve.outputs.context }}
+          file: upstream/${{ steps.resolve.outputs.dockerfile }}
+          tags: ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.version }}
+          push: true
+          load: ${{ steps.resolve.outputs.multiarch == 'false' }}
+          platforms: ${{ steps.resolve.outputs.platforms }}
+          build-args: ${{ steps.resolve.outputs.build_args }}
+          labels: ${{ steps.resolve.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache,mode=min
+
+      - id: smoke
+        name: Smoke test it without a GPU
+        if: steps.fresh.outputs.exists != 'true' && steps.resolve.outputs.has_smoke == 'true'
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/plan.py --smoke "${{ matrix.app }}" --out smoke.sh
+          docker run --rm --entrypoint /bin/bash \
+            -v "$PWD/smoke.sh:/smoke.sh:ro" "$IMAGE:$VERSION" /smoke.sh
+
+      - name: Move the rolling tags only if the smoke test passed
+        if: steps.fresh.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAGS: ${{ steps.resolve.outputs.tags }}
+        run: |
+          set -euo pipefail
+          python - > moving-tags <<'PY'
+          import json, os
+          version = os.environ["VERSION"]
+          for tag in json.loads(os.environ["TAGS"]):
+              if tag != version:
+                  print(tag)
+          PY
+          if [[ ! -s moving-tags ]]; then
+            echo "publish_latest: false and no series tags - only $VERSION was published"
+            exit 0
+          fi
+          args=()
+          mapfile -t rolling < moving-tags
+          for tag in "${rolling[@]}"; do args+=( -t "$IMAGE:$tag" ); done
+          echo "promoting: ${rolling[*]}"
+          docker buildx imagetools create "${args[@]}" "$IMAGE:$VERSION"
+
+      - name: Record what happened
+        if: always()
+        env:
+          APP: ${{ matrix.app }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          URL: ${{ steps.resolve.outputs.release_url }}
+          EXISTED: ${{ steps.fresh.outputs.exists }}
+          HASSMOKE: ${{ steps.resolve.outputs.has_smoke }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          BUILT: ${{ steps.build.outcome }}
+        run: |
+          set -uo pipefail
+          if [[ "$EXISTED" == true ]]; then
+            state="already current"
+          elif [[ "$BUILT" == success ]]; then
+            state="built"
+          else
+            state="FAILED ($BUILT)"
+          fi
+          gate="none (smoke_test empty)"
+          if [[ "$HASSMOKE" == true ]]; then gate="smoke: ${SMOKE:-not run}"; fi
+          {
+            printf -- '- **%s** `%s` (%s) - %s, gate %s\n' "$APP" "${VERSION:-?}" "${SHA:0:7}" "$state" "$gate"
+            if [[ -n "$URL" ]]; then printf '  %s\n' "$URL"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: Summary
+    if: always()
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fail the run if any app failed
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate > jobs.json
+          python - <<'PY'
+          import json, os, sys
+          jobs = json.load(open("jobs.json"))["jobs"]
+          rows = [j for j in jobs if j["name"].startswith("build (")]
+          print("## image builds\n")
+          print("| app | result |")
+          print("|---|---|")
+          bad = []
+          for j in rows:
+              app = j["name"].removeprefix("build (").removesuffix(")")
+              print(f"| {app} | {j['conclusion']} |")
+              if j["conclusion"] != "success":
+                  bad.append((app, j["html_url"]))
+          if not rows:
+              print("\n_nothing was built: every app already current, or none enabled_")
+          if bad:
+              print("\nThese apps did **not** get a new image, so they will silently go stale:")
+              for app, url in bad:
+                  print(f"- {app}: {url}")
+              sys.exit(1)
+          PY

@@ -1,0 +1,40 @@
+# Image build list. One entry per container you want published on ghcr.io.
+#
+# `track` decides what "stay updated" means:
+#   release -> build upstream's newest published release tag (recommended: tested,
+#              versioned, and gives you roll-back tags)
+#   branch  -> build the tip of a branch (newer, untested, tagged <branch>-<shortsha>)
+#
+# Adding an app = add an entry here. Nothing else to touch.
+
+apps:
+
+  - name: basalt
+    upstream: jesdga95/basalt      # owner/repo of the project, never a fork of it
+    enabled: true
+    track: release
+    dockerfile: Dockerfile         # path inside the upstream repo
+    context: .
+    platforms: [linux/amd64]       # amd64 only: emulated arm64 costs hours for no benefit
+    build_args:
+      CUDA_TAG: "13.4.3"
+    series_tags: true              # from a v0.3.3 release also push v0.3 and v0
+    publish_latest: true           # the rolling tag the container pulls
+    labels:
+      org.opencontainers.image.source: https://github.com/jesdga95/basalt
+      org.opencontainers.image.licenses: MIT
+    # Commands run inside the finished image, no GPU needed. Non-zero exit stops `latest`
+    # from moving, so a broken upstream build cannot reach your running container.
+    # These catch the two failures that actually happen: a base image that drops a library
+    # the engine links, and the venv's absolute install-root path drifting.
+    smoke_test:
+      - test -x /opt/basalt/bin/basalt
+      - test -x /opt/basalt/bin/basalt-vision
+      - test -d /opt/basalt/data/profiles
+      - test -f /opt/basalt/.venv/bin/python
+      - /opt/basalt/.venv/bin/python -c "print('venv ok')"
+      - |
+        if ldd /opt/basalt/bin/basalt | grep "not found"; then
+          echo "smoke: unresolved shared libraries" >&2; exit 1
+        fi
+      - basalt --help >/dev/null
