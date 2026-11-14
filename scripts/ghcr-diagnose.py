@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Explain why ghcr.io refused a push, without ever printing a credential.
+"""Ask ghcr.io, in the open, whether this repository may write a package.
 
-The runner's GITHUB_TOKEN had `Packages: write` and GHCR still answered
-`permission_denied: write_package`, so the block is somewhere between the
-credential and the account. These two facts separate the causes:
+Behavioural, cheap, and leaves nothing behind: the registry answers the same
+question docker/buildx is about to ask, one HTTP call at a time.
 
-  - what scopes GHCR is willing to grant this credential for this repository
-    (the JWT it hands out says so; we decode it and print only the access list)
-  - what a plain read of the same repository answers (404 = not created yet and
-    reads are fine, 401/403 = the account itself is gated)
+    pull check   GET  /v2/<name>/manifests/<tag>
+    push check   POST /v2/<name>/blobs/uploads/     202 = may write
+                 the upload is never committed, so it creates no package,
+                 no blob and no tag
 
-Never prints the workflow token or the registry token it receives.
+The point is to tell three otherwise identical-looking denials apart:
+
+    package name already owned by another repository  real name refused,
+                                                      a fresh name accepted
+    account gated (terms of service, billing)         both refused
+    transient/registry fault                          both accepted, build
+                                                      still fails
+
+Neither the workflow token nor the registry token it receives is ever printed.
 
 Env: IMAGE (ghcr.io/owner/name), GHCR_USER, GHCR_TOKEN
 """
@@ -23,9 +30,21 @@ import sys
 import urllib.error
 import urllib.request
 
+# A manifest list/index is what most images actually are; asking for only a
+# manifest makes the registry answer "OCI index found, but Accept header..."
+# which is a clue in itself but hides the status we want.
+ACCEPT = ", ".join(
+    [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+)
 
-def basic(user: str, password: str) -> str:
-    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+def basic(user: str, secret: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode()
 
 
 def fetch(url: str, headers: dict[str, str]) -> tuple[int, str]:
@@ -39,70 +58,80 @@ def fetch(url: str, headers: dict[str, str]) -> tuple[int, str]:
         return 0, str(exc.reason)
 
 
-def access_claims(registry_token: str) -> object:
-    """The `access` list from the JWT payload. The signature is not verified and is not needed."""
+def registry_token(registry: str, repo: str, user: str, secret: str) -> tuple[str, str, int]:
+    """(token, raw body, status). The token is returned for use, never printed."""
+    scope = f"repository:{repo}:push,pull"
+    status, body = fetch(
+        f"https://{registry}/token?service={registry}&scope={scope}",
+        {"Authorization": basic(user, secret)},
+    )
+    if status != 200:
+        return "", body, status
     try:
-        payload = registry_token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload)).get("access")
-    except Exception as exc:                                    # noqa: BLE001
-        return f"undecodable ({exc})"
+        return json.loads(body).get("token", ""), "", status
+    except json.JSONDecodeError:
+        return "", body, status
+
+
+def probe(name: str, registry: str, user: str, secret: str) -> bool:
+    """Return True if the registry would let this credential write `name`."""
+    token, body, status = registry_token(registry, name, user, secret)
+    print(f"\npackage: {name}")
+    if status != 200:
+        print(f"  token request -> HTTP {status}: {body[:300]}")
+        return False
+    if not token:
+        print("  token request returned 200 but no token")
+        return False
+
+    status, body = fetch(f"https://{registry}/v2/{name}/manifests/latest",
+                         {"Authorization": f"Bearer {token}", "Accept": ACCEPT})
+    read = {200: "exists and is readable", 404: "no manifest at latest",
+            401: "read refused", 403: "read refused"}.get(status, f"HTTP {status}")
+    print(f"  read  latest -> {status} ({read}) {body[:160] if status >= 400 else ''}")
+
+    status, body = fetch(f"https://{registry}/v2/{name}/blobs/uploads/",
+                         {"Authorization": f"Bearer {token}"})
+    may_write = status in (201, 202, 204)
+    verdict = "MAY WRITE" if may_write else "refused"
+    print(f"  write probe -> {status} ({verdict}) {body[:200] if not may_write else ''}")
+    return may_write
 
 
 def main() -> int:
     image = os.environ.get("IMAGE", "")
     user = os.environ.get("GHCR_USER", "")
-    token = os.environ.get("GHCR_TOKEN", "")
-    if not image.count("/") == 2 or not user or not token:
+    secret = os.environ.get("GHCR_TOKEN", "")
+    if image.count("/") != 2 or not user or not secret:
         print("ghcr-diagnose: needs IMAGE (ghcr.io/owner/name), GHCR_USER, GHCR_TOKEN")
         return 2
 
     registry, _, repo = image.partition("/")
-    print(f"registry: {registry}   repository: {repo}")
+    print(f"registry: {registry}")
 
-    status, body = fetch(f"https://{registry}/v2/", {})
-    print(f"GET /v2/ -> {status} {body[:120]}")
+    configured = probe(repo, registry, user, secret)
+    # A name this account has certainly never used. If this one is writable and
+    # the configured one is not, the block is the package name, not the account.
+    throwaway = f"{repo}-pushcheck"
+    scratch = probe(throwaway, registry, user, secret)
 
-    status, body = fetch(
-        f"https://{registry}/token?service={registry}&scope=repository:{repo}:push,pull",
-        {"Authorization": basic(user, token)},
-    )
-    print(f"token endpoint (push,pull) -> HTTP {status}")
-    registry_token = ""
-    if status == 200:
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            payload = {}
-            print(f"  body is not JSON: {body[:200]}")
-        registry_token = payload.get("token", "")
-        issued = payload.get("issued_at", "")
-        print(f"  issued_at: {issued}")
-        print(f"  granted access: {json.dumps(access_claims(registry_token))}")
-        granted = access_claims(registry_token)
-        actions = set()
-        if isinstance(granted, list):
-            for entry in granted:
-                actions.update(entry.get("actions", []))
-        if "push" not in actions:
-            print("  -> GHCR will not grant push to this credential for this repository.")
-            print("     The workflow token itself is not the problem; the registry is refusing")
-            print("     the capability. That is the account-gated case (terms of service,")
-            print("     billing category, or a package name owned elsewhere).")
-    else:
-        print(f"  error body: {body[:400]}")
-        print("  -> GHCR refused to issue a scoped token; the body above is the reason it gives.")
+    print("\nverdict:")
+    if configured and scratch:
+        print("  both writable: the denial is not permission-shaped; look again at the build")
         return 0
-
-    if registry_token:
-        auth = {"Authorization": f"Bearer {registry_token}"}
-        for ref in ("latest", "push-probe"):
-            status, body = fetch(f"https://{registry}/v2/{repo}/manifests/{ref}",
-                                 {**auth, "Accept": "application/vnd.oci.image.manifest.v1+json"})
-            print(f"HEAD-equivalent manifests/{ref} -> HTTP {status} {body[:160]}")
-        print("  -> 401/403 above with push granted means the account, not the token, is gated.")
-        print("     404 means reads are fine and the package simply does not exist yet.")
-    return 0
+    if not configured and scratch:
+        print(f"  {repo} is refused while {throwaway} would be accepted.")
+        print("  That package name is already owned by another repository in this account -")
+        print("  ghcr.io links a package to exactly one repository and will not let a second")
+        print("  one write it. Delete the old package or use a different name in containers.yml.")
+        return 3
+    if configured and not scratch:
+        print("  the configured name is writable but a fresh name is not: unexpected, and")
+        print("  most likely a stale package-link for the new name. Not a blocker here.")
+        return 0
+    print("  no package name is writable with this credential: the account or the token is")
+    print("  gated (terms of service, billing category, or a token without package write).")
+    return 4
 
 
 if __name__ == "__main__":
