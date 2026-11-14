@@ -134,27 +134,44 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! docker buildx build --push -t "$IMAGE:push-probe" scripts/pushprobe 2> probe.err; then
-            sed 's/^/  /' probe.err >&2
-            python3 scripts/ghcr-diagnose.py | tee ghcr-diagnose.txt || true
-            {
-              echo "### $IMAGE refused a push, so nothing was built"
-              echo
-              echo "The workflow token had \`packages: write\`, so this is an account-level block. Check, in order:"
-              echo
-              echo "1. **Docker terms of service not accepted on the account** - open any package page while signed in (github.com/\`<you>\`?tab=packages) and accept the banner, or run one \`docker push ghcr.io/\`<you>\`/anything\` from a logged-in machine and follow the link it returns."
-              echo "2. **Package name already taken by another repository** in this account - GHCR will not let one repo write another repo's package. Rename the package in containers.yml or delete the stale one."
-              echo "3. **Packages quota/billing state** - a blocked or exhausted billing category also refuses new packages."
-              echo
-              echo "What GHCR itself says about this credential (no secrets in it):"
-              echo
-              echo '```'
-              cat ghcr-diagnose.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+          if docker buildx build --push -t "$IMAGE:push-probe" scripts/pushprobe; then
+            echo "push path confirmed"
+            exit 0
           fi
-          echo "push path confirmed"
+          echo "$IMAGE refused a push; is any name writable?"
+          if docker buildx build --push -t "${IMAGE}-pushcheck:push-probe" scripts/pushprobe; then
+            verdict=name
+          else
+            verdict=account
+          fi
+          python3 scripts/ghcr-diagnose.py | tee ghcr-diagnose.txt || true
+          {
+            echo "### push refused, nothing was built"
+            echo
+            if [ "$verdict" = name ]; then
+              echo "**This repository can publish; the package name $IMAGE cannot be written from it.**"
+              echo
+              echo "ghcr.io links each package to exactly one repository, and the read probe below"
+              echo "shows content already at 'latest' - an existing package of that name, owned"
+              echo "elsewhere in this account, is in the way. Fix one side:"
+              echo
+              echo "- delete the old package: its page, Package settings, Delete this package. Then the name is free, or"
+              echo "- point containers.yml at a new name and it is created fresh, linked here."
+            else
+              echo "**No package name is writable with this credential**, so the block is account-level:"
+              echo
+              echo "1. Docker terms of service not accepted on the account - open a Packages page signed in and accept the banner."
+              echo "2. Packages billing category blocked or exhausted."
+              echo "3. A policy cap on what GITHUB_TOKEN may do - then publish with a fine-grained PAT secret scoped to write:packages."
+            fi
+            echo
+            echo "What the registry says about reads for this name (no secrets in it):"
+            echo
+            echo '```'
+            cat ghcr-diagnose.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       - name: Check out the upstream project at that commit
         if: steps.fresh.outputs.exists != 'true'
@@ -235,6 +252,8 @@ jobs:
           PKG: ${{ matrix.app }}
         run: |
           set -uo pipefail
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/packages/container/${PKG}-pushcheck" \
+            >/dev/null 2>&1 && echo "removed the throwaway package" || true
           ids=$(gh api "repos/$GITHUB_REPOSITORY/packages/container/$PKG/versions" \
                   --jq '.[] | select(.name == "push-probe") | .id' 2>/dev/null) || exit 0
           for id in $ids; do

@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Ask ghcr.io, in the open, whether this repository may write a package.
+"""Report what ghcr.io already knows about a package name, before we blame the workflow.
 
-Behavioural, cheap, and leaves nothing behind: the registry answers the same
-question docker/buildx is about to ask, one HTTP call at a time.
+A `permission_denied: write_package` on a push says the registry refused. It does
+not say why, and three different situations look identical: the package name is
+owned by another repository in the same account, the account itself is gated, or
+the token was never meant to write packages. What does separate them is what the
+registry will happily show for reads:
 
-    pull check   GET  /v2/<name>/manifests/<tag>
-    push check   POST /v2/<name>/blobs/uploads/     202 = may write
-                 the upload is never committed, so it creates no package,
-                 no blob and no tag
+    tags list       a name that already has tags is not a free name
+    manifest        content at 'latest' means somebody published it before
+    token request   whether the registry will issue a scoped token at all
 
-The point is to tell three otherwise identical-looking denials apart:
-
-    package name already owned by another repository  real name refused,
-                                                      a fresh name accepted
-    account gated (terms of service, billing)         both refused
-    transient/registry fault                          both accepted, build
-                                                      still fails
+Read capability is deliberately not a stand-in for write capability: ghcr.io
+answers writes by attempting them, and the probe step in the workflow does that
+with a 1 KB image under a name the account has never used.
 
 Neither the workflow token nor the registry token it receives is ever printed.
 
@@ -30,9 +28,9 @@ import sys
 import urllib.error
 import urllib.request
 
-# A manifest list/index is what most images actually are; asking for only a
-# manifest makes the registry answer "OCI index found, but Accept header..."
-# which is a clue in itself but hides the status we want.
+# Most images are indexes/manifest lists. Asking only for a single manifest makes
+# the registry answer "OCI index found, but Accept header does not support OCI
+# indexes" - true, but it hides the fact that the manifest exists.
 ACCEPT = ", ".join(
     [
         "application/vnd.oci.image.index.v1+json",
@@ -47,55 +45,15 @@ def basic(user: str, secret: str) -> str:
     return "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode()
 
 
-def fetch(url: str, headers: dict[str, str]) -> tuple[int, str]:
+def fetch(url: str, headers: dict[str, str]) -> tuple[int, str, dict[str, str]]:
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
+            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
+        return exc.code, exc.read().decode("utf-8", "replace"), dict(exc.headers.items())
     except urllib.error.URLError as exc:
-        return 0, str(exc.reason)
-
-
-def registry_token(registry: str, repo: str, user: str, secret: str) -> tuple[str, str, int]:
-    """(token, raw body, status). The token is returned for use, never printed."""
-    scope = f"repository:{repo}:push,pull"
-    status, body = fetch(
-        f"https://{registry}/token?service={registry}&scope={scope}",
-        {"Authorization": basic(user, secret)},
-    )
-    if status != 200:
-        return "", body, status
-    try:
-        return json.loads(body).get("token", ""), "", status
-    except json.JSONDecodeError:
-        return "", body, status
-
-
-def probe(name: str, registry: str, user: str, secret: str) -> bool:
-    """Return True if the registry would let this credential write `name`."""
-    token, body, status = registry_token(registry, name, user, secret)
-    print(f"\npackage: {name}")
-    if status != 200:
-        print(f"  token request -> HTTP {status}: {body[:300]}")
-        return False
-    if not token:
-        print("  token request returned 200 but no token")
-        return False
-
-    status, body = fetch(f"https://{registry}/v2/{name}/manifests/latest",
-                         {"Authorization": f"Bearer {token}", "Accept": ACCEPT})
-    read = {200: "exists and is readable", 404: "no manifest at latest",
-            401: "read refused", 403: "read refused"}.get(status, f"HTTP {status}")
-    print(f"  read  latest -> {status} ({read}) {body[:160] if status >= 400 else ''}")
-
-    status, body = fetch(f"https://{registry}/v2/{name}/blobs/uploads/",
-                         {"Authorization": f"Bearer {token}"})
-    may_write = status in (201, 202, 204)
-    verdict = "MAY WRITE" if may_write else "refused"
-    print(f"  write probe -> {status} ({verdict}) {body[:200] if not may_write else ''}")
-    return may_write
+        return 0, str(exc.reason), {}
 
 
 def main() -> int:
@@ -107,31 +65,52 @@ def main() -> int:
         return 2
 
     registry, _, repo = image.partition("/")
-    print(f"registry: {registry}")
+    print(f"registry: {registry}   name: {repo}")
 
-    configured = probe(repo, registry, user, secret)
-    # A name this account has certainly never used. If this one is writable and
-    # the configured one is not, the block is the package name, not the account.
-    throwaway = f"{repo}-pushcheck"
-    scratch = probe(throwaway, registry, user, secret)
+    status, body, _ = fetch(
+        f"https://{registry}/token?service={registry}&scope=repository:{repo}:pull",
+        {"Authorization": basic(user, secret)},
+    )
+    print(f"token request -> HTTP {status}" + ("" if status == 200 else f": {body[:240]}"))
+    if status != 200:
+        print("  the registry refused even a pull scope for this name; that is the account or")
+        print("  the credential being refused outright, not a name collision.")
+        return 0
+    token = json.loads(body).get("token", "")
+    auth = {"Authorization": f"Bearer {token}"}
 
-    print("\nverdict:")
-    if configured and scratch:
-        print("  both writable: the denial is not permission-shaped; look again at the build")
-        return 0
-    if not configured and scratch:
-        print(f"  {repo} is refused while {throwaway} would be accepted.")
-        print("  That package name is already owned by another repository in this account -")
-        print("  ghcr.io links a package to exactly one repository and will not let a second")
-        print("  one write it. Delete the old package or use a different name in containers.yml.")
-        return 3
-    if configured and not scratch:
-        print("  the configured name is writable but a fresh name is not: unexpected, and")
-        print("  most likely a stale package-link for the new name. Not a blocker here.")
-        return 0
-    print("  no package name is writable with this credential: the account or the token is")
-    print("  gated (terms of service, billing category, or a token without package write).")
-    return 4
+    tag_status, body, _ = fetch(f"https://{registry}/v2/{repo}/tags/list", auth)
+    print(f"tags -> HTTP {tag_status}: {body[:300]}")
+    tags: list[str] = []
+    if tag_status == 200:
+        try:
+            tags = json.loads(body).get("tags") or []
+        except json.JSONDecodeError:
+            pass
+
+    status, body, headers = fetch(f"https://{registry}/v2/{repo}/manifests/latest",
+                                  {**auth, "Accept": ACCEPT})
+    digest = headers.get("Docker-Content-Digest") or headers.get("docker-content-digest") or "?"
+    media = ""
+    if status == 200:
+        try:
+            media = json.loads(body).get("mediaType", "")
+        except json.JSONDecodeError:
+            pass
+    print(f"manifest 'latest' -> HTTP {status} digest {digest} {media}")
+
+    print()
+    if tags:
+        print(f"this name is not free: {len(tags)} tag(s) already published - {', '.join(tags[:12])}")
+        print("A package is linked to exactly one repository. If this workflow's repository is")
+        print("not the one it is linked to, no token from here will ever be allowed to write it.")
+    elif tag_status == 200 or status == 200:
+        print("the registry answers for this name but shows no tags: it is registered to someone,")
+        print("and this repository is not the one allowed to write it.")
+    else:
+        print("no published tags visible under this name, so the name looks free and the refusal")
+        print("is coming from the account or the credential rather than a collision.")
+    return 0
 
 
 if __name__ == "__main__":
