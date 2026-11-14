@@ -130,10 +130,13 @@ jobs:
         if: steps.fresh.outputs.exists != 'true'
         env:
           IMAGE: ${{ steps.resolve.outputs.image }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if ! docker buildx build --push -t "$IMAGE:push-probe" scripts/pushprobe 2> probe.err; then
             sed 's/^/  /' probe.err >&2
+            python3 scripts/ghcr-diagnose.py | tee ghcr-diagnose.txt || true
             {
               echo "### $IMAGE refused a push, so nothing was built"
               echo
@@ -142,6 +145,12 @@ jobs:
               echo "1. **Docker terms of service not accepted on the account** - open any package page while signed in (github.com/\`<you>\`?tab=packages) and accept the banner, or run one \`docker push ghcr.io/\`<you>\`/anything\` from a logged-in machine and follow the link it returns."
               echo "2. **Package name already taken by another repository** in this account - GHCR will not let one repo write another repo's package. Rename the package in containers.yml or delete the stale one."
               echo "3. **Packages quota/billing state** - a blocked or exhausted billing category also refuses new packages."
+              echo
+              echo "What GHCR itself says about this credential (no secrets in it):"
+              echo
+              echo '```'
+              cat ghcr-diagnose.txt
+              echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi

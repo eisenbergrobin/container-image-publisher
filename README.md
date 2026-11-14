@@ -190,7 +190,7 @@ a monthly minute.
 | Build job dies with "no space left on device" | CUDA base images are big. The run already prunes images and unused toolchains; if it still fails, raise `timeout-minutes` and check you are not building many GB-scale apps on one runner |
 | Nothing sees a new image | for private packages, the pulling side has no `read:packages` token, so the pull and the version check both fail |
 | Container starts then exits, no logs | wrong GPU: basalt is compiled for sm_120 (Blackwell) only |
-| `denied: permission_denied: write_package` | an account-level block, not a workflow one: unaccepted Docker terms of service, a package name already owned by another repo in the account, or a blocked billing category. The probe step names these in the run summary, and fails in seconds so no compile is wasted on it |
+| `denied: permission_denied: write_package` | an account-level block, not a workflow one: unaccepted Docker terms of service, a package name already owned by another repo in the account, or a blocked billing category. The probe step fails in seconds so no compile is wasted, and its run summary quotes what GHCR will grant this credential - scopes granted with push present means the account is gated, not the token |
 
 ## Alternatives, and why this one
 
