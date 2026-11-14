@@ -18,6 +18,8 @@ weekly (Mon 05:17 UTC) or manual
   plan    validate containers.yml, verify each upstream Dockerfile still exists, build a matrix
   build   resolve the upstream ref to one exact commit
           skip if that version tag is already in ghcr.io
+          probe ghcr.io with a 1 KB throwaway tag: a registry permission block
+          should cost five seconds, not 25 minutes of compile
           check out upstream AT THAT COMMIT
           build and push only the immutable version tag (v0.3.3)
           run the app's smoke test inside the image, no GPU needed
@@ -188,6 +190,7 @@ a monthly minute.
 | Build job dies with "no space left on device" | CUDA base images are big. The run already prunes images and unused toolchains; if it still fails, raise `timeout-minutes` and check you are not building many GB-scale apps on one runner |
 | Nothing sees a new image | for private packages, the pulling side has no `read:packages` token, so the pull and the version check both fail |
 | Container starts then exits, no logs | wrong GPU: basalt is compiled for sm_120 (Blackwell) only |
+| `denied: permission_denied: write_package` | an account-level block, not a workflow one: unaccepted Docker terms of service, a package name already owned by another repo in the account, or a blocked billing category. The probe step names these in the run summary, and fails in seconds so no compile is wasted on it |
 
 ## Alternatives, and why this one
 

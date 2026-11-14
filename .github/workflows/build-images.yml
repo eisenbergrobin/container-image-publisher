@@ -126,6 +126,27 @@ jobs:
             echo "$IMAGE:$VERSION is new - building it"
           fi
 
+      - name: Probe that ghcr.io will accept a push
+        if: steps.fresh.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          set -euo pipefail
+          if ! docker buildx build --push -t "$IMAGE:push-probe" scripts/pushprobe 2> probe.err; then
+            sed 's/^/  /' probe.err >&2
+            {
+              echo "### $IMAGE refused a push, so nothing was built"
+              echo
+              echo "The workflow token had \`packages: write\`, so this is an account-level block. Check, in order:"
+              echo
+              echo "1. **Docker terms of service not accepted on the account** - open any package page while signed in (github.com/\`<you>\`?tab=packages) and accept the banner, or run one \`docker push ghcr.io/\`<you>\`/anything\` from a logged-in machine and follow the link it returns."
+              echo "2. **Package name already taken by another repository** in this account - GHCR will not let one repo write another repo's package. Rename the package in containers.yml or delete the stale one."
+              echo "3. **Packages quota/billing state** - a blocked or exhausted billing category also refuses new packages."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "push path confirmed"
+
       - name: Check out the upstream project at that commit
         if: steps.fresh.outputs.exists != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -197,6 +218,20 @@ jobs:
           for tag in "${rolling[@]}"; do args+=( -t "$IMAGE:$tag" ); done
           echo "promoting: ${rolling[*]}"
           docker buildx imagetools create "${args[@]}" "$IMAGE:$VERSION"
+
+      - name: Delete the probe tag
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG: ${{ matrix.app }}
+        run: |
+          set -uo pipefail
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/packages/container/$PKG/versions" \
+                  --jq '.[] | select(.name == "push-probe") | .id' 2>/dev/null) || exit 0
+          for id in $ids; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/packages/container/$PKG/versions/$id" >/dev/null \
+              && echo "deleted probe version $id" || echo "could not delete probe version $id"
+          done
 
       - name: Record what happened
         if: always()
