@@ -126,56 +126,6 @@ jobs:
             echo "$IMAGE:$VERSION is new - building it"
           fi
 
-      - name: Probe that ghcr.io will accept a push
-        id: probe
-        if: steps.fresh.outputs.exists != 'true'
-        env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if docker buildx build --push -t "$IMAGE:push-probe" scripts/pushprobe; then
-            echo "tag=true" >> "$GITHUB_OUTPUT"
-            echo "push path confirmed"
-            exit 0
-          fi
-          echo "$IMAGE refused a push; is any name writable?"
-          if docker buildx build --push -t "${IMAGE}-pushcheck:push-probe" scripts/pushprobe; then
-            verdict=name
-            echo "pkg=true" >> "$GITHUB_OUTPUT"
-          else
-            verdict=account
-          fi
-          python3 scripts/ghcr-diagnose.py | tee ghcr-diagnose.txt || true
-          {
-            echo "### push refused, nothing was built"
-            echo
-            if [ "$verdict" = name ]; then
-              echo "**This repository can publish; the package name $IMAGE cannot be written from it.**"
-              echo
-              echo "ghcr.io links each package to exactly one repository, and the read probe below"
-              echo "shows content already at 'latest' - an existing package of that name, owned"
-              echo "elsewhere in this account, is in the way. Fix one side:"
-              echo
-              echo "- delete the old package: its page, Package settings, Delete this package. Then the name is free, or"
-              echo "- point containers.yml at a new name and it is created fresh, linked here."
-            else
-              echo "**No package name is writable with this credential**, so the block is account-level:"
-              echo
-              echo "1. Docker terms of service not accepted on the account - open a Packages page signed in and accept the banner."
-              echo "2. Packages billing category blocked or exhausted."
-              echo "3. A policy cap on what GITHUB_TOKEN may do - then publish with a fine-grained PAT secret scoped to write:packages."
-            fi
-            echo
-            echo "What the registry says about reads for this name (no secrets in it):"
-            echo
-            echo '```'
-            cat ghcr-diagnose.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-
       - name: Check out the upstream project at that commit
         if: steps.fresh.outputs.exists != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -247,33 +197,6 @@ jobs:
           for tag in "${rolling[@]}"; do args+=( -t "$IMAGE:$tag" ); done
           echo "promoting: ${rolling[*]}"
           docker buildx imagetools create "${args[@]}" "$IMAGE:$VERSION"
-
-      - name: Delete what the probe left behind
-        if: always() && (steps.probe.outputs.tag == 'true' || steps.probe.outputs.pkg == 'true')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PKG: ${{ matrix.app }}
-          THROWAWAY: ${{ steps.probe.outputs.pkg }}
-          PROBE_TAG: ${{ steps.probe.outputs.tag }}
-        run: |
-          set -uo pipefail
-          # The repository-scoped routes only see packages linked to this repository, which
-          # is exactly the fact a collision denies us, so go through the owner's namespace.
-          owner="$GITHUB_REPOSITORY_OWNER"
-          if [ "$THROWAWAY" = true ]; then
-            if gh api -X DELETE "users/$owner/packages/container/${PKG}-pushcheck" >/dev/null 2>&1; then
-              echo "removed the throwaway package ${PKG}-pushcheck"
-            else
-              echo "the workflow token could not remove ${PKG}-pushcheck; delete it from the packages page if it is listed"
-            fi
-          fi
-          [ "$PROBE_TAG" = true ] || exit 0
-          ids=$(gh api --paginate "users/$owner/packages/container/$PKG/versions" \
-                  --jq '.[] | select(.name == "push-probe") | .id' 2>/dev/null) || true
-          for id in $ids; do
-            gh api -X DELETE "users/$owner/packages/container/$PKG/versions/$id" >/dev/null \
-              && echo "deleted probe version $id" || echo "could not delete probe version $id"
-          done
 
       - name: Record what happened
         if: always()
