@@ -18,7 +18,7 @@ apps:
     platforms: [linux/amd64]       # amd64 only: emulated arm64 costs hours for no benefit
     build_args:
       CUDA_TAG: "13.4.3"
-    series_tags: true              # from a v0.3.3 release also push v0.3 and v0
+    series_tags: false             # no v0.5 / v0 series tags: the version tag and latest only
     publish_latest: true           # the rolling tag the container pulls
     labels:
       org.opencontainers.image.source: https://github.com/jesdga95/basalt

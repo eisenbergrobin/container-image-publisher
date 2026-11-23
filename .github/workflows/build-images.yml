@@ -158,6 +158,11 @@ jobs:
           platforms: ${{ steps.resolve.outputs.platforms }}
           build-args: ${{ steps.resolve.outputs.build_args }}
           labels: ${{ steps.resolve.outputs.labels }}
+          # BuildKit defaults to mode=min provenance, which pushes an extra attestation
+          # manifest per image. GHCR lists that manifest as its own untagged version, so
+          # the package page fills up with bare sha256 rows that are not images. Traceability
+          # here comes from the immutable version tag plus the revision label, so skip it.
+          provenance: false
           cache-from: type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ steps.resolve.outputs.image }}:buildcache,mode=min
 
